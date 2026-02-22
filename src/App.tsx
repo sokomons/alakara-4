@@ -120,8 +120,28 @@ const DashboardLayout: React.FC<{ user: User; onLogout: () => void; children: Re
 
   const filteredMenu = menuItems.filter(item => item.roles.includes(user.role));
 
+  const getBackgroundClass = (role: string) => {
+    switch (role) {
+      case 'super_admin':
+      case 'associate_admin':
+        return 'bg-slate-100';
+      case 'school_head':
+        return 'bg-blue-50';
+      case 'teacher':
+        return 'bg-emerald-50';
+      case 'student':
+        return 'bg-amber-50';
+      case 'librarian':
+        return 'bg-purple-50';
+      case 'accounts_clerk':
+        return 'bg-rose-50';
+      default:
+        return 'bg-slate-50';
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-slate-50 flex">
+    <div className={`min-h-screen ${getBackgroundClass(user.role)} flex transition-colors duration-500`}>
       {/* Sidebar */}
       <aside 
         className={`${isSidebarOpen ? 'w-64' : 'w-20'} bg-kenya-black text-white transition-all duration-300 flex flex-col`}

@@ -4,7 +4,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
-import db from './src/db.ts';
+import supabase from './src/db.ts';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -29,29 +29,37 @@ async function startServer() {
   };
 
   // Seed Super Admin
-  const seedSuperAdmin = () => {
-    const admin = db.prepare('SELECT * FROM users WHERE role = ?').get('super_admin');
-    if (!admin) {
-      const hashedPassword = bcrypt.hashSync('admin123', 10);
-      db.prepare('INSERT INTO users (name, username, password, role) VALUES (?, ?, ?, ?)')
-        .run('Super Admin', 'admin', hashedPassword, 'super_admin');
-      console.log('Super Admin seeded: admin / admin123');
+  const seedSuperAdmin = async () => {
+    try {
+      const { data: admin } = await supabase.from('app_users').select('*').eq('role', 'super_admin').maybeSingle();
+      if (!admin) {
+        const hashedPassword = bcrypt.hashSync('admin123', 10);
+        await supabase.from('app_users').insert({ name: 'Super Admin', username: 'admin', password: hashedPassword, role: 'super_admin' });
+        console.log('Super Admin seeded: admin / admin123');
+      }
+    } catch (e) {
+      console.error('Error seeding super admin:', e);
     }
   };
   seedSuperAdmin();
 
-  const seedSubjects = () => {
-    const schools = db.prepare('SELECT id FROM schools').all() as any[];
-    const defaultSubjects = ['Mathematics', 'English', 'Kiswahili', 'Science', 'Social Studies'];
-    
-    schools.forEach(school => {
-      defaultSubjects.forEach(subjectName => {
-        const exists = db.prepare('SELECT id FROM subjects WHERE school_id = ? AND name = ?').get(school.id, subjectName);
-        if (!exists) {
-          db.prepare('INSERT INTO subjects (school_id, name) VALUES (?, ?)').run(school.id, subjectName);
+  const seedSubjects = async () => {
+    try {
+      const { data: schools } = await supabase.from('schools').select('id');
+      if (schools) {
+        const defaultSubjects = ['Mathematics', 'English', 'Kiswahili', 'Science', 'Social Studies'];
+        for (const school of schools) {
+          for (const subjectName of defaultSubjects) {
+            const { data: exists } = await supabase.from('subjects').select('id').eq('school_id', school.id).eq('name', subjectName).maybeSingle();
+            if (!exists) {
+              await supabase.from('subjects').insert({ school_id: school.id, name: subjectName });
+            }
+          }
         }
-      });
-    });
+      }
+    } catch (e) {
+      console.error('Error seeding subjects:', e);
+    }
   };
   seedSubjects();
 
@@ -69,9 +77,10 @@ async function startServer() {
   };
 
   // Auth Routes
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body;
-    const user: any = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    const { data: user } = await supabase.from('app_users').select('*').eq('username', username).maybeSingle();
+    
     if (!user || !bcrypt.compareSync(password, user.password)) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
@@ -80,105 +89,112 @@ async function startServer() {
   });
 
   // Super Admin Routes
-  app.post('/api/schools', authenticate, (req: any, res) => {
+  app.post('/api/schools', authenticate, async (req: any, res) => {
     if (req.user.role !== 'super_admin' && req.user.role !== 'associate_admin') return res.status(403).json({ error: 'Forbidden' });
     const { name, address, phone, email, motto, headTeacherName, headTeacherUsername, headTeacherPassword } = req.body;
     
     try {
-      let schoolId: number | bigint;
-      db.transaction(() => {
-        const result = db.prepare('INSERT INTO schools (name, address, phone, email, motto) VALUES (?, ?, ?, ?, ?)').run(name, address || null, phone || null, email || null, motto || null);
-        schoolId = result.lastInsertRowid;
-        
-        if (headTeacherName && headTeacherUsername && headTeacherPassword) {
-          const hashedPassword = bcrypt.hashSync(headTeacherPassword, 10);
-          db.prepare('INSERT INTO users (name, username, password, role, school_id) VALUES (?, ?, ?, ?, ?)')
-            .run(headTeacherName, headTeacherUsername, hashedPassword, 'school_head', schoolId);
-        }
-      })();
-      res.json({ id: schoolId!, name });
+      const { data: school, error } = await supabase.from('schools').insert({ name, address, phone, email, motto }).select().single();
+      if (error) throw error;
+      
+      if (headTeacherName && headTeacherUsername && headTeacherPassword) {
+        const hashedPassword = bcrypt.hashSync(headTeacherPassword, 10);
+        await supabase.from('app_users').insert({
+          name: headTeacherName,
+          username: headTeacherUsername,
+          password: hashedPassword,
+          role: 'school_head',
+          school_id: school.id
+        });
+      }
+      res.json({ id: school.id, name });
     } catch (err: any) {
       console.error(err);
       res.status(500).json({ error: 'Failed to create school' });
     }
   });
 
-  app.get('/api/schools', authenticate, (req: any, res) => {
+  app.get('/api/schools', authenticate, async (req: any, res) => {
     if (req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
-    const schools = db.prepare('SELECT * FROM schools').all();
-    res.json(schools);
+    const { data: schools } = await supabase.from('schools').select('*');
+    res.json(schools || []);
   });
 
-  app.get('/api/schools/:id/details', authenticate, (req: any, res) => {
+  app.get('/api/schools/:id/details', authenticate, async (req: any, res) => {
     if (req.user.role !== 'super_admin' && req.user.role !== 'associate_admin') return res.status(403).json({ error: 'Forbidden' });
     const schoolId = req.params.id;
-    const school = db.prepare('SELECT * FROM schools WHERE id = ?').get(schoolId);
+    
+    const { data: school } = await supabase.from('schools').select('*').eq('id', schoolId).single();
     if (!school) return res.status(404).json({ error: 'School not found' });
 
-    const headTeacher = db.prepare('SELECT name, username FROM users WHERE school_id = ? AND role = ?').get(schoolId, 'school_head');
-    const studentsCount = db.prepare('SELECT COUNT(*) as count FROM users WHERE school_id = ? AND role = ?').get(schoolId, 'student') as any;
-    const teachersCount = db.prepare('SELECT COUNT(*) as count FROM users WHERE school_id = ? AND role = ?').get(schoolId, 'teacher') as any;
+    const { data: headTeacher } = await supabase.from('app_users').select('name, username').eq('school_id', schoolId).eq('role', 'school_head').maybeSingle();
+    const { count: studentsCount } = await supabase.from('app_users').select('*', { count: 'exact', head: true }).eq('school_id', schoolId).eq('role', 'student');
+    const { count: teachersCount } = await supabase.from('app_users').select('*', { count: 'exact', head: true }).eq('school_id', schoolId).eq('role', 'teacher');
 
     res.json({
       ...school,
       headTeacher: headTeacher || null,
       stats: {
-        students: studentsCount.count,
-        teachers: teachersCount.count
+        students: studentsCount || 0,
+        teachers: teachersCount || 0
       }
     });
   });
 
   // Classes Routes
-  app.post('/api/classes', authenticate, (req: any, res) => {
+  app.post('/api/classes', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const { name } = req.body;
     const schoolId = req.user.school_id;
     try {
-      const result = db.prepare('INSERT INTO classes (school_id, name) VALUES (?, ?)').run(schoolId, name);
-      res.json({ id: result.lastInsertRowid, name, school_id: schoolId });
+      const { data: cls, error } = await supabase.from('classes').insert({ school_id: schoolId, name }).select().single();
+      if (error) throw error;
+      res.json(cls);
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to create class' });
     }
   });
 
-  app.get('/api/classes', authenticate, (req: any, res) => {
+  app.get('/api/classes', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const classes = db.prepare('SELECT * FROM classes WHERE school_id = ?').all(schoolId);
-    res.json(classes);
+    const { data: classes } = await supabase.from('classes').select('*').eq('school_id', schoolId);
+    res.json(classes || []);
   });
 
-  app.get('/api/classes/:id/students', authenticate, (req: any, res) => {
+  app.get('/api/classes/:id/students', authenticate, async (req: any, res) => {
     const classId = req.params.id;
     const schoolId = req.user.school_id;
-    // Verify class belongs to school
-    const cls = db.prepare('SELECT * FROM classes WHERE id = ? AND school_id = ?').get(classId, schoolId);
+    
+    const { data: cls } = await supabase.from('classes').select('*').eq('id', classId).eq('school_id', schoolId).maybeSingle();
     if (!cls) return res.status(404).json({ error: 'Class not found' });
 
-    const students = db.prepare(`
-      SELECT u.id, u.name, u.username, u.admission_number
-      FROM users u
-      JOIN enrollments e ON u.id = e.student_id
-      WHERE e.class_id = ? AND u.role = 'student'
-    `).all(classId);
-    res.json(students);
+    const { data: enrollments } = await supabase.from('enrollments').select('student_id').eq('class_id', classId);
+    if (!enrollments || enrollments.length === 0) return res.json([]);
+    
+    const studentIds = enrollments.map(e => e.student_id);
+    const { data: students } = await supabase.from('app_users')
+      .select('id, name, username, admission_number')
+      .in('id', studentIds)
+      .eq('role', 'student');
+      
+    res.json(students || []);
   });
 
-  app.post('/api/classes/:id/students', authenticate, (req: any, res) => {
+  app.post('/api/classes/:id/students', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const classId = req.params.id;
     const schoolId = req.user.school_id;
     const { name, username, password, admission_number } = req.body;
     
     try {
-      db.transaction(() => {
-        const hashedPassword = bcrypt.hashSync(password, 10);
-        const result = db.prepare('INSERT INTO users (name, username, password, role, school_id, admission_number) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(name, username, hashedPassword, 'student', schoolId, admission_number);
-        
-        const studentId = result.lastInsertRowid;
-        db.prepare('INSERT INTO enrollments (student_id, class_id) VALUES (?, ?)').run(studentId, classId);
-      })();
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      const { data: student, error } = await supabase.from('app_users').insert({
+        name, username, password: hashedPassword, role: 'student', school_id: schoolId, admission_number
+      }).select().single();
+      
+      if (error) throw error;
+      
+      await supabase.from('enrollments').insert({ student_id: student.id, class_id: classId });
       res.json({ success: true });
     } catch (err: any) {
       console.error(err);
@@ -186,15 +202,13 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/classes/:classId/students/:studentId', authenticate, (req: any, res) => {
+  app.delete('/api/classes/:classId/students/:studentId', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const { classId, studentId } = req.params;
     
     try {
-      db.transaction(() => {
-        db.prepare('DELETE FROM enrollments WHERE student_id = ? AND class_id = ?').run(studentId, classId);
-        db.prepare('DELETE FROM users WHERE id = ? AND role = ?').run(studentId, 'student');
-      })();
+      await supabase.from('enrollments').delete().eq('student_id', studentId).eq('class_id', classId);
+      await supabase.from('app_users').delete().eq('id', studentId).eq('role', 'student');
       res.json({ success: true });
     } catch (err: any) {
       console.error(err);
@@ -203,21 +217,21 @@ async function startServer() {
   });
 
   // School Head Routes
-  app.get('/api/school/stats', authenticate, (req: any, res) => {
+  app.get('/api/school/stats', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const teachers = db.prepare('SELECT COUNT(*) as count FROM users WHERE school_id = ? AND role = ?').get(schoolId, 'teacher') as any;
-    const students = db.prepare('SELECT COUNT(*) as count FROM users WHERE school_id = ? AND role = ?').get(schoolId, 'student') as any;
-    const classes = db.prepare('SELECT COUNT(*) as count FROM classes WHERE school_id = ?').get(schoolId) as any;
-    res.json({ teachers: teachers.count, students: students.count, classes: classes.count });
+    const { count: teachers } = await supabase.from('app_users').select('*', { count: 'exact', head: true }).eq('school_id', schoolId).eq('role', 'teacher');
+    const { count: students } = await supabase.from('app_users').select('*', { count: 'exact', head: true }).eq('school_id', schoolId).eq('role', 'student');
+    const { count: classes } = await supabase.from('classes').select('*', { count: 'exact', head: true }).eq('school_id', schoolId);
+    
+    res.json({ teachers: teachers || 0, students: students || 0, classes: classes || 0 });
   });
 
   // Grading System Routes
-  app.get('/api/grading', authenticate, (req: any, res) => {
+  app.get('/api/grading', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const grading = db.prepare('SELECT * FROM grading_systems WHERE school_id = ? ORDER BY min_score DESC').all(schoolId);
+    const { data: grading } = await supabase.from('grading_systems').select('*').eq('school_id', schoolId).order('min_score', { ascending: false });
     
-    if (grading.length === 0) {
-      // Return default grading system
+    if (!grading || grading.length === 0) {
       const defaultGrading = [
         { min_score: 80, max_score: 100, grade: 'A', points: 12 },
         { min_score: 75, max_score: 79, grade: 'A-', points: 11 },
@@ -238,19 +252,15 @@ async function startServer() {
     }
   });
 
-  app.post('/api/grading', authenticate, (req: any, res) => {
+  app.post('/api/grading', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const schoolId = req.user.school_id;
-    const { grading } = req.body; // Array of grading objects
+    const { grading } = req.body;
     
     try {
-      db.transaction(() => {
-        db.prepare('DELETE FROM grading_systems WHERE school_id = ?').run(schoolId);
-        const insert = db.prepare('INSERT INTO grading_systems (school_id, min_score, max_score, grade, points) VALUES (?, ?, ?, ?, ?)');
-        for (const g of grading) {
-          insert.run(schoolId, g.min_score, g.max_score, g.grade, g.points);
-        }
-      })();
+      await supabase.from('grading_systems').delete().eq('school_id', schoolId);
+      const inserts = grading.map((g: any) => ({ school_id: schoolId, min_score: g.min_score, max_score: g.max_score, grade: g.grade, points: g.points }));
+      await supabase.from('grading_systems').insert(inserts);
       res.json({ success: true });
     } catch (err) {
       console.error(err);
@@ -259,34 +269,42 @@ async function startServer() {
   });
 
   // Marks Routes
-  app.post('/api/marks', authenticate, (req: any, res) => {
+  app.post('/api/marks', authenticate, async (req: any, res) => {
     if (req.user.role !== 'teacher' && req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const { student_id, subject_id, score, term, year } = req.body;
     
-    // Check if mark already exists to update instead of insert
-    const existing = db.prepare('SELECT id FROM marks WHERE student_id = ? AND subject_id = ? AND term = ? AND year = ?').get(student_id, subject_id, term, year);
+    const { data: existing } = await supabase.from('marks')
+      .select('id')
+      .eq('student_id', student_id)
+      .eq('subject_id', subject_id)
+      .eq('term', term)
+      .eq('year', year)
+      .maybeSingle();
     
     if (existing) {
-      db.prepare('UPDATE marks SET score = ?, teacher_id = ? WHERE id = ?')
-        .run(score, req.user.id, (existing as any).id);
+      await supabase.from('marks').update({ score, teacher_id: req.user.id }).eq('id', existing.id);
     } else {
-      db.prepare('INSERT INTO marks (student_id, subject_id, teacher_id, score, term, year) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(student_id, subject_id, req.user.id, score, term, year);
+      await supabase.from('marks').insert({ student_id, subject_id, teacher_id: req.user.id, score, term, year });
     }
     
     broadcast({ type: 'MARKS_UPDATED', school_id: req.user.school_id });
     res.json({ success: true });
   });
 
-  app.put('/api/marks', authenticate, (req: any, res) => {
+  app.put('/api/marks', authenticate, async (req: any, res) => {
     if (req.user.role !== 'teacher' && req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const { student_id, subject_id, score, term, year } = req.body;
     
-    const existing = db.prepare('SELECT id FROM marks WHERE student_id = ? AND subject_id = ? AND term = ? AND year = ?').get(student_id, subject_id, term, year);
+    const { data: existing } = await supabase.from('marks')
+      .select('id')
+      .eq('student_id', student_id)
+      .eq('subject_id', subject_id)
+      .eq('term', term)
+      .eq('year', year)
+      .maybeSingle();
     
     if (existing) {
-      db.prepare('UPDATE marks SET score = ?, teacher_id = ? WHERE id = ?')
-        .run(score, req.user.id, (existing as any).id);
+      await supabase.from('marks').update({ score, teacher_id: req.user.id }).eq('id', existing.id);
       broadcast({ type: 'MARKS_UPDATED', school_id: req.user.school_id });
       res.json({ success: true });
     } else {
@@ -294,42 +312,54 @@ async function startServer() {
     }
   });
 
-  app.get('/api/marks', authenticate, (req: any, res) => {
+  app.get('/api/marks', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin' && req.user.role !== 'teacher') return res.status(403).json({ error: 'Forbidden' });
     const schoolId = req.user.school_id;
     const { class_id, subject_id, term, year } = req.query;
 
-    let query = `
-      SELECT m.*, u.name as student_name, u.admission_number, s.name as subject_name
-      FROM marks m
-      JOIN users u ON m.student_id = u.id
-      JOIN subjects s ON m.subject_id = s.id
-      WHERE u.school_id = ?
-    `;
-    const params: any[] = [schoolId];
+    let query = supabase.from('marks').select('*');
+    if (subject_id) query = query.eq('subject_id', subject_id);
+    if (term) query = query.eq('term', term);
+    if (year) query = query.eq('year', year);
+
+    const { data: marks } = await query;
+    if (!marks || marks.length === 0) return res.json([]);
+
+    // Fetch related data manually to avoid complex joins if schema is not perfectly set up
+    const studentIds = [...new Set(marks.map(m => m.student_id))];
+    const subjectIds = [...new Set(marks.map(m => m.subject_id))];
+
+    let studentsQuery = supabase.from('app_users').select('id, name, admission_number, school_id').in('id', studentIds).eq('school_id', schoolId);
+    const { data: students } = await studentsQuery;
+    
+    if (!students || students.length === 0) return res.json([]);
+    const validStudentIds = students.map(s => s.id);
+    
+    let filteredMarks = marks.filter(m => validStudentIds.includes(m.student_id));
 
     if (class_id) {
-      query += ` AND u.id IN (SELECT student_id FROM enrollments WHERE class_id = ?)`;
-      params.push(class_id);
-    }
-    if (subject_id) {
-      query += ` AND m.subject_id = ?`;
-      params.push(subject_id);
-    }
-    if (term) {
-      query += ` AND m.term = ?`;
-      params.push(term);
-    }
-    if (year) {
-      query += ` AND m.year = ?`;
-      params.push(year);
+      const { data: enrollments } = await supabase.from('enrollments').select('student_id').eq('class_id', class_id).in('student_id', validStudentIds);
+      const enrolledStudentIds = (enrollments || []).map(e => e.student_id);
+      filteredMarks = filteredMarks.filter(m => enrolledStudentIds.includes(m.student_id));
     }
 
-    const marks = db.prepare(query).all(...params);
-    res.json(marks);
+    const { data: subjects } = await supabase.from('subjects').select('id, name').in('id', subjectIds);
+
+    const result = filteredMarks.map(m => {
+      const student = students.find(s => s.id === m.student_id);
+      const subject = (subjects || []).find(s => s.id === m.subject_id);
+      return {
+        ...m,
+        student_name: student?.name,
+        admission_number: student?.admission_number,
+        subject_name: subject?.name
+      };
+    });
+
+    res.json(result);
   });
 
-  app.get('/api/marks/process', authenticate, (req: any, res) => {
+  app.get('/api/marks/process', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const schoolId = req.user.school_id;
     const { class_id, term, year } = req.query;
@@ -338,28 +368,22 @@ async function startServer() {
       return res.status(400).json({ error: 'Missing parameters' });
     }
 
-    // Get all students in the class
-    const students = db.prepare(`
-      SELECT u.id, u.name, u.admission_number
-      FROM users u
-      JOIN enrollments e ON u.id = e.student_id
-      WHERE e.class_id = ? AND u.school_id = ?
-    `).all(class_id, schoolId);
+    const { data: enrollments } = await supabase.from('enrollments').select('student_id').eq('class_id', class_id);
+    if (!enrollments || enrollments.length === 0) return res.json({ subjects: [], results: [] });
+    
+    const studentIds = enrollments.map(e => e.student_id);
+    const { data: students } = await supabase.from('app_users').select('id, name, admission_number').in('id', studentIds).eq('school_id', schoolId);
+    
+    const { data: subjects } = await supabase.from('subjects').select('id, name').eq('school_id', schoolId);
+    
+    const { data: marks } = await supabase.from('marks')
+      .select('student_id, subject_id, score')
+      .in('student_id', studentIds)
+      .eq('term', term)
+      .eq('year', year);
 
-    // Get all subjects for the school
-    const subjects = db.prepare('SELECT id, name FROM subjects WHERE school_id = ?').all(schoolId);
-
-    // Get all marks for these students for the given term and year
-    const marks = db.prepare(`
-      SELECT m.student_id, m.subject_id, m.score
-      FROM marks m
-      JOIN users u ON m.student_id = u.id
-      WHERE u.school_id = ? AND m.term = ? AND m.year = ?
-    `).all(schoolId, term, year);
-
-    // Process data
-    const results = students.map((student: any) => {
-      const studentMarks = marks.filter((m: any) => m.student_id === student.id);
+    const results = (students || []).map((student: any) => {
+      const studentMarks = (marks || []).filter((m: any) => m.student_id === student.id);
       const marksBySubject: Record<number, number> = {};
       let totalScore = 0;
       
@@ -370,7 +394,6 @@ async function startServer() {
 
       const averageScore = studentMarks.length > 0 ? totalScore / studentMarks.length : 0;
       
-      // Simple grading logic
       let grade = 'E';
       if (averageScore >= 80) grade = 'A';
       else if (averageScore >= 70) grade = 'B';
@@ -386,107 +409,131 @@ async function startServer() {
       };
     });
 
-    // Sort by total score descending
     results.sort((a: any, b: any) => b.totalScore - a.totalScore);
 
     res.json({
-      subjects,
+      subjects: subjects || [],
       results
     });
   });
 
-  app.get('/api/marks/analysis', authenticate, (req: any, res) => {
+  app.get('/api/marks/analysis', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    // Simple analysis: average score per student
-    const analysis = db.prepare(`
-      SELECT u.name, AVG(m.score) as average_score
-      FROM marks m
-      JOIN users u ON m.student_id = u.id
-      WHERE u.school_id = ?
-      GROUP BY u.id
-      ORDER BY average_score DESC
-    `).all(schoolId);
+    
+    const { data: students } = await supabase.from('app_users').select('id, name').eq('school_id', schoolId).eq('role', 'student');
+    if (!students || students.length === 0) return res.json([]);
+    
+    const studentIds = students.map(s => s.id);
+    const { data: marks } = await supabase.from('marks').select('student_id, score').in('student_id', studentIds);
+    
+    const analysis = students.map(student => {
+      const studentMarks = (marks || []).filter(m => m.student_id === student.id);
+      const average_score = studentMarks.length > 0 
+        ? studentMarks.reduce((sum, m) => sum + m.score, 0) / studentMarks.length 
+        : 0;
+      return { name: student.name, average_score };
+    }).sort((a, b) => b.average_score - a.average_score);
+    
     res.json(analysis);
   });
 
   // Materials Routes
-  app.post('/api/materials', authenticate, (req: any, res) => {
+  app.post('/api/materials', authenticate, async (req: any, res) => {
     if (req.user.role !== 'teacher') return res.status(403).json({ error: 'Forbidden' });
     const { title, type, content } = req.body;
-    db.prepare('INSERT INTO materials (school_id, teacher_id, title, type, content) VALUES (?, ?, ?, ?, ?)')
-      .run(req.user.school_id, req.user.id, title, type, content);
+    await supabase.from('materials').insert({
+      school_id: req.user.school_id,
+      teacher_id: req.user.id,
+      title,
+      type,
+      content
+    });
     res.json({ success: true });
   });
 
-  app.get('/api/materials', authenticate, (req: any, res) => {
+  app.get('/api/materials', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const materials = db.prepare('SELECT * FROM materials WHERE school_id = ? AND status = ?').all(schoolId, 'approved');
-    res.json(materials);
+    const { data: materials } = await supabase.from('materials').select('*').eq('school_id', schoolId).eq('status', 'approved');
+    res.json(materials || []);
   });
 
   // User Management
-  app.post('/api/users', authenticate, (req: any, res) => {
+  app.post('/api/users', authenticate, async (req: any, res) => {
     const { name, username, password, role, school_id, admission_number } = req.body;
     const hashedPassword = bcrypt.hashSync(password, 10);
-    db.prepare('INSERT INTO users (name, username, password, role, school_id, admission_number) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(name, username, hashedPassword, role, school_id || req.user.school_id, admission_number);
+    await supabase.from('app_users').insert({
+      name,
+      username,
+      password: hashedPassword,
+      role,
+      school_id: school_id || req.user.school_id,
+      admission_number
+    });
     res.json({ success: true });
   });
 
-  app.get('/api/users/students', authenticate, (req: any, res) => {
+  app.get('/api/users/students', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const students = db.prepare('SELECT id, name, admission_number FROM users WHERE school_id = ? AND role = ?').all(schoolId, 'student');
-    res.json(students);
+    const { data: students } = await supabase.from('app_users').select('id, name, admission_number').eq('school_id', schoolId).eq('role', 'student');
+    res.json(students || []);
   });
 
-  app.get('/api/users/teachers', authenticate, (req: any, res) => {
+  app.get('/api/users/teachers', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const teachers = db.prepare('SELECT id, name, username FROM users WHERE school_id = ? AND role = ?').all(schoolId, 'teacher');
-    res.json(teachers);
+    const { data: teachers } = await supabase.from('app_users').select('id, name, username').eq('school_id', schoolId).eq('role', 'teacher');
+    res.json(teachers || []);
   });
 
-  app.get('/api/subjects', authenticate, (req: any, res) => {
+  app.get('/api/subjects', authenticate, async (req: any, res) => {
     const schoolId = req.user.school_id;
-    const subjects = db.prepare('SELECT * FROM subjects WHERE school_id = ?').all(schoolId);
-    res.json(subjects);
+    const { data: subjects } = await supabase.from('subjects').select('*').eq('school_id', schoolId);
+    res.json(subjects || []);
   });
 
-  app.post('/api/subjects', authenticate, (req: any, res) => {
+  app.post('/api/subjects', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const { name } = req.body;
     const schoolId = req.user.school_id;
     try {
-      const result = db.prepare('INSERT INTO subjects (school_id, name) VALUES (?, ?)').run(schoolId, name);
-      res.json({ id: result.lastInsertRowid, name, school_id: schoolId });
+      const { data: subject, error } = await supabase.from('subjects').insert({ school_id: schoolId, name }).select().single();
+      if (error) throw error;
+      res.json(subject);
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to create subject' });
     }
   });
 
-  app.delete('/api/subjects/:id', authenticate, (req: any, res) => {
+  app.delete('/api/subjects/:id', authenticate, async (req: any, res) => {
     if (req.user.role !== 'school_head' && req.user.role !== 'super_admin') return res.status(403).json({ error: 'Forbidden' });
     const subjectId = req.params.id;
     const schoolId = req.user.school_id;
     try {
-      // Optional: Check if marks exist for this subject before deleting, or cascade delete
-      db.prepare('DELETE FROM subjects WHERE id = ? AND school_id = ?').run(subjectId, schoolId);
+      await supabase.from('subjects').delete().eq('id', subjectId).eq('school_id', schoolId);
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to delete subject' });
     }
   });
 
-  app.get('/api/student/marks', authenticate, (req: any, res) => {
+  app.get('/api/student/marks', authenticate, async (req: any, res) => {
     if (req.user.role !== 'student') return res.status(403).json({ error: 'Forbidden' });
     const studentId = req.user.id;
-    const marks = db.prepare(`
-      SELECT m.*, COALESCE(s.name, 'Unknown Subject') as subject_name
-      FROM marks m
-      LEFT JOIN subjects s ON m.subject_id = s.id
-      WHERE m.student_id = ?
-      ORDER BY m.year DESC, m.term DESC
-    `).all(studentId);
-    res.json(marks);
+    
+    const { data: marks } = await supabase.from('marks').select('*').eq('student_id', studentId).order('year', { ascending: false }).order('term', { ascending: false });
+    if (!marks || marks.length === 0) return res.json([]);
+    
+    const subjectIds = [...new Set(marks.map(m => m.subject_id))];
+    const { data: subjects } = await supabase.from('subjects').select('id, name').in('id', subjectIds);
+    
+    const result = marks.map(m => {
+      const subject = (subjects || []).find(s => s.id === m.subject_id);
+      return {
+        ...m,
+        subject_name: subject?.name || 'Unknown Subject'
+      };
+    });
+    
+    res.json(result);
   });
 
   // Vite middleware for development
