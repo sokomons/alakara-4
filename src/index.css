@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+@theme {
+  --color-kenya-black: #000000;
+  --color-kenya-red: #BB0613;
+  --color-kenya-green: #006600;
+  --color-kenya-white: #FFFFFF;
+}
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900;
+  }
+}
